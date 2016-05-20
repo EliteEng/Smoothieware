@@ -10,6 +10,8 @@
 #ifndef EXTURDER_MODULE_H
 #define EXTRUDER_MODULE_H
 
+#include <vector>
+
 #include "Tool.h"
 #include "Pin.h"
 
@@ -53,7 +55,7 @@ class Extruder : public Tool {
             float steps_per_millimeter;         // Steps to travel one millimeter
             float filament_diameter;            // filament diameter
             float extruder_multiplier;          // flow rate 1.0 == 100%
-            float acceleration;                 // extruder accleration SOLO setting
+            float acceleration;                 // extruder acceleration SOLO setting
             float retract_length;               // firmware retract length
             float current_position;             // Current point ( in mm ) for the current move, incremented every time a move is executed
         };
@@ -61,7 +63,7 @@ class Extruder : public Tool {
         float saved_current_position;
         float volumetric_multiplier;
         float feed_rate;                // default rate mm/sec for SOLO moves only
-        float milestone_last_position;  // used for calculating volumemetric rate, last position in mm³
+        float milestone_last_position;  // used for calculating volumetric rate, last position in mm³
         float max_volumetric_rate;      // used for calculating volumetric rate in mm³/sec
 
         float travel_ratio;
@@ -84,6 +86,10 @@ class Extruder : public Tool {
             bool milestone_absolute_mode:1;
         };
 
+        std::string mix_char;
+        std::vector<float> ext_mix = {0.0,0.0,0.0};
+        uint8_t cur_tool;
+        bool mixer;
 
 };
 
