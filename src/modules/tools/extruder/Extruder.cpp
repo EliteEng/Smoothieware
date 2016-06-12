@@ -61,6 +61,8 @@
 #define retract_zlift_length_checksum        CHECKSUM("retract_zlift_length")
 #define retract_zlift_feedrate_checksum      CHECKSUM("retract_zlift_feedrate")
 
+#define mixture_char_checksum                CHECKSUM("mixture_char")
+
 #define X_AXIS      0
 #define Y_AXIS      1
 #define Z_AXIS      2
@@ -90,8 +92,10 @@ Extruder::Extruder( uint16_t config_identifier, bool single )
     this->stepper_motor = nullptr;
     this->milestone_last_position = 0;
     this->max_volumetric_rate = 0;
+    this->mixer = false;
 
     memset(this->offset, 0, sizeof(this->offset));
+
 }
 
 Extruder::~Extruder()
@@ -172,6 +176,7 @@ void Extruder::on_config_reload(void *argument)
         this->offset[Y_AXIS] = THEKERNEL->config->value(extruder_checksum, this->identifier, y_offset_checksum          )->by_default(0)->as_number();
         this->offset[Z_AXIS] = THEKERNEL->config->value(extruder_checksum, this->identifier, z_offset_checksum          )->by_default(0)->as_number();
 
+        this->mix_char = THEKERNEL->config->value(extruder_checksum, this->identifier, mixture_char_checksum         )->as_string();
     }
 
     // these are only supported in the new syntax, no need to be backward compatible as they did not exist before the change
@@ -202,7 +207,7 @@ void Extruder::on_get_public_data(void *argument)
 
     if(!pdr->starts_with(extruder_checksum)) return;
 
-    if(this->enabled) {
+    if(this->enabled || this->mixer) {
         // Note this is allowing both step/mm and filament diameter to be exposed via public data
         pdr->set_data_ptr(&this->steps_per_millimeter);
         pdr->set_taken();
@@ -294,14 +299,17 @@ void Extruder::on_gcode_received(void *argument)
 {
     Gcode *gcode = static_cast<Gcode *>(argument);
 
+    if( gcode->has_letter('T') ) {
+        cur_tool = gcode->get_value('T');
+    }
     // M codes most execute immediately, most only execute if enabled
     if (gcode->has_m) {
-        if (gcode->m == 114 && gcode->subcode == 0 && this->enabled) {
+        if (gcode->m == 114 && gcode->subcode == 0 && (this->enabled || this->mixer)) {
             char buf[16];
             int n = snprintf(buf, sizeof(buf), " E:%1.3f ", this->current_position);
             gcode->txt_after_ok.append(buf, n);
 
-        } else if (gcode->m == 92 && ( (this->enabled && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier) ) ) {
+        } else if (gcode->m == 92 && ( ((this->enabled || this->mixer) && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier) ) ) {
             float spm = this->steps_per_millimeter;
             if (gcode->has_letter('E')) {
                 spm = gcode->get_value('E');
@@ -311,7 +319,7 @@ void Extruder::on_gcode_received(void *argument)
             gcode->stream->printf("E:%g ", spm);
             gcode->add_nl = true;
 
-        } else if (gcode->m == 200 && ( (this->enabled && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
+        } else if (gcode->m == 200 && ( ((this->enabled || this->mixer) && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
             if (gcode->has_letter('D')) {
                 THEKERNEL->conveyor->wait_for_empty_queue(); // only apply after the queue has emptied
                 this->filament_diameter = gcode->get_value('D');
@@ -328,7 +336,7 @@ void Extruder::on_gcode_received(void *argument)
                 }
             }
 
-        } else if (gcode->m == 203 && ( (this->enabled && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
+        } else if (gcode->m == 203 && ( ((this->enabled || this->mixer) && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
             // M203 Exxx Vyyy Set maximum feedrates xxx mm/sec and/or yyy mm³/sec
             if(gcode->get_num_args() == 0) {
                 gcode->stream->printf("E:%g V:%g", this->stepper_motor->get_max_rate(), this->max_volumetric_rate);
@@ -344,23 +352,23 @@ void Extruder::on_gcode_received(void *argument)
             }
 
         } else if (gcode->m == 204 && gcode->has_letter('E') &&
-                   ( (this->enabled && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
+                   ( ((this->enabled || this->mixer) && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
             // extruder acceleration M204 Ennn mm/sec^2 (Pnnn sets the specific extruder for M500)
             this->acceleration = gcode->get_value('E');
 
-        } else if (gcode->m == 207 && ( (this->enabled && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
+        } else if (gcode->m == 207 && ( ((this->enabled || this->mixer) && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
             // M207 - set retract length S[positive mm] F[feedrate mm/min] Z[additional zlift/hop] Q[zlift feedrate mm/min]
             if(gcode->has_letter('S')) retract_length = gcode->get_value('S');
             if(gcode->has_letter('F')) retract_feedrate = gcode->get_value('F') / 60.0F; // specified in mm/min converted to mm/sec
             if(gcode->has_letter('Z')) retract_zlift_length = gcode->get_value('Z');
             if(gcode->has_letter('Q')) retract_zlift_feedrate = gcode->get_value('Q');
 
-        } else if (gcode->m == 208 && ( (this->enabled && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
+        } else if (gcode->m == 208 && ( ((this->enabled || this->mixer) && !gcode->has_letter('P')) || (gcode->has_letter('P') && gcode->get_value('P') == this->identifier)) ) {
             // M208 - set retract recover length S[positive mm surplus to the M207 S*] F[feedrate mm/min]
             if(gcode->has_letter('S')) retract_recover_length = gcode->get_value('S');
             if(gcode->has_letter('F')) retract_recover_feedrate = gcode->get_value('F') / 60.0F; // specified in mm/min converted to mm/sec
 
-        } else if (gcode->m == 221 && this->enabled) { // M221 S100 change flow rate by percentage
+        } else if (gcode->m == 221 && (this->enabled || this->mixer)) { // M221 S100 change flow rate by percentage
             if(gcode->has_letter('S')) {
                 this->extruder_multiplier = gcode->get_value('S') / 100.0F;
             } else {
@@ -391,7 +399,25 @@ void Extruder::on_gcode_received(void *argument)
                 }
             }
 
-        } else if( gcode->m == 17 || gcode->m == 18 || gcode->m == 82 || gcode->m == 83 || gcode->m == 84 ) {
+        } else if (gcode->m == 610 && gcode->has_letter(this->mix_char.at(0))) {
+            if (gcode->has_letter('S')) {
+
+                uint8_t mix_tool = gcode->get_value('S');
+                float mix_value = gcode->get_value(this->mix_char.at(0) / 100.0F);
+
+                THEKERNEL->conveyor->wait_for_empty_queue(); // only apply after the queue has emptied
+
+                this->mixer = true;
+                this->ext_mix[mix_tool] = mix_value;
+
+            } else {
+                gcode->stream->printf("M610 Usage M610 S(tool number) A100 B0 C0 (mix value in percent)\n");
+            }
+
+        } else if (gcode->m == 611 && gcode->has_letter(this->mix_char.at(0))) {
+            this->mixer = false;
+
+        } else if (gcode->m == 17 || gcode->m == 18 || gcode->m == 82 || gcode->m == 83 || gcode->m == 84 ) {
             // Mcodes to pass along to on_gcode_execute
             THEKERNEL->conveyor->append_gcode(gcode);
 
@@ -403,13 +429,13 @@ void Extruder::on_gcode_received(void *argument)
             // Gcodes to pass along to on_gcode_execute
             THEKERNEL->conveyor->append_gcode(gcode);
 
-        } else if( this->enabled && gcode->g < 4 && gcode->has_letter('E') && fabsf(gcode->millimeters_of_travel) < 0.00001F ) { // With floating numbers, we can have 0 != 0, NOTE needs to be same as in Robot.cpp#745
+        } else if( (this->enabled || this->mixer) && gcode->g < 4 && gcode->has_letter('E') && fabsf(gcode->millimeters_of_travel) < 0.00001F ) { // With floating numbers, we can have 0 != 0, NOTE needs to be same as in Robot.cpp#745
             // NOTE was ... gcode->has_letter('E') && !gcode->has_letter('X') && !gcode->has_letter('Y') && !gcode->has_letter('Z') ) {
             // This is a SOLO move, we add an empty block to the queue to prevent subsequent gcodes being executed at the same time
             THEKERNEL->conveyor->append_gcode(gcode);
             THEKERNEL->conveyor->queue_head_block();
 
-        } else if( this->enabled && (gcode->g == 10 || gcode->g == 11) && !gcode->has_letter('L') ) {
+        } else if( (this->enabled || this->mixer) && (gcode->g == 10 || gcode->g == 11) && !gcode->has_letter('L') ) {
             // firmware retract command (Ignore if has L parameter that is not for us)
             // check we are in the correct state of retract or unretract
             if(gcode->g == 10 && !retracted) {
@@ -450,7 +476,7 @@ void Extruder::on_gcode_received(void *argument)
                 THEKERNEL->robot->pop_state(); // restore state includes feed rates etc
             }
 
-        } else if( this->enabled && this->retracted && (gcode->g == 0 || gcode->g == 1) && gcode->has_letter('Z')) {
+        } else if( (this->enabled || this->mixer) && this->retracted && (gcode->g == 0 || gcode->g == 1) && gcode->has_letter('Z')) {
             // NOTE we cancel the zlift restore for the following G11 as we have moved to an absolute Z which we need to stay at
             this->cancel_zlift_restore = true;
         }
@@ -469,7 +495,7 @@ void Extruder::on_gcode_received(void *argument)
             case 90: this->milestone_absolute_mode = true; break;
             case 91: this->milestone_absolute_mode = false; break;
             case 92:
-                if(this->enabled) {
+                if(this->enabled || this->mixer) {
                     if(gcode->has_letter('E')) {
                         this->milestone_last_position = gcode->get_value('E');
                     } else if(gcode->get_num_args() == 0) {
@@ -516,7 +542,7 @@ void Extruder::on_gcode_execute(void *argument)
     }
 
 
-    if( gcode->has_g && this->enabled ) {
+    if( gcode->has_g && (this->enabled || this->mixer) ) {
         // G92: Reset extruder position
         if( gcode->g == 92 ) {
             if( gcode->has_letter('E') ) {
@@ -547,10 +573,17 @@ void Extruder::on_gcode_execute(void *argument)
 
         } else if (gcode->g <= 3) {
             // Extrusion length from 'G' Gcode
-            if( gcode->has_letter('E' )) {
+            if( gcode->has_letter('E') ) {
                 // Get relative extrusion distance depending on mode ( in absolute mode we must subtract target_position )
                 float extrusion_distance = gcode->get_value('E');
-                float relative_extrusion_distance = extrusion_distance;
+                float relative_extrusion_distance;
+
+                if (this->mixer) {
+                    relative_extrusion_distance = (extrusion_distance * this->ext_mix[cur_tool]);
+                } else {
+                    relative_extrusion_distance = extrusion_distance;
+                }
+
                 if (this->absolute_mode) {
                     relative_extrusion_distance -= this->target_position;
                     this->target_position = extrusion_distance;
@@ -584,7 +617,7 @@ void Extruder::on_gcode_execute(void *argument)
 // When a new block begins, either follow the robot, or step by ourselves ( or stay back and do nothing )
 void Extruder::on_block_begin(void *argument)
 {
-    if(!this->enabled) return;
+    if(!this->enabled || !this->mixer) return;
 
     if( this->mode == OFF ) {
         this->current_block = NULL;
@@ -638,7 +671,7 @@ void Extruder::on_block_begin(void *argument)
 // When a block ends, pause the stepping interrupt
 void Extruder::on_block_end(void *argument)
 {
-    if(!this->enabled) return;
+    if(!(this->enabled || this->mixer)) return;
     this->current_block = NULL;
 }
 
@@ -652,7 +685,7 @@ uint32_t Extruder::rate_increase() const
 void Extruder::acceleration_tick(void)
 {
     // Avoid trying to work when we really shouldn't ( between blocks or re-entry )
-    if(!this->enabled || this->mode != SOLO || this->current_block == NULL || !this->stepper_motor->is_moving() ) {
+    if((!this->enabled || !this->mixer) || this->mode != SOLO || this->current_block == NULL || !this->stepper_motor->is_moving() ) {
         return;
     }
 
@@ -672,7 +705,7 @@ void Extruder::acceleration_tick(void)
 void Extruder::on_speed_change( void *argument )
 {
     // Avoid trying to work when we really shouldn't ( between blocks or re-entry )
-    if(!this->enabled || this->current_block == NULL || this->mode != FOLLOW || !this->stepper_motor->is_moving()) {
+    if((!this->enabled || !this->mixer) || this->current_block == NULL || this->mode != FOLLOW || !this->stepper_motor->is_moving()) {
         return;
     }
 
@@ -700,7 +733,7 @@ void Extruder::on_speed_change( void *argument )
 // When the stepper has finished it's move
 uint32_t Extruder::stepper_motor_finished_move(uint32_t dummy)
 {
-    if(!this->enabled) return 0;
+    if(!this->enabled || !this->mixer) return 0;
 
     //printf("extruder releasing\r\n");
 
